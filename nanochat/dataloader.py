@@ -22,6 +22,56 @@ import pyarrow.parquet as pq
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
+
+def pop_best_fit_conversation(conversation_buffer, max_length, bos_token, truncate_if_needed=False):
+    """Pop the largest buffered conversation that fits entirely in max_length.
+
+    Returns (ids, mask) for the popped conversation, or None when nothing fits and
+    truncation was not requested.
+
+    When no conversation fits and truncate_if_needed is set (only when starting an
+    empty row), fall back to the shortest buffered conversation and crop it to
+    max_length. render_conversation places the supervised (mask==1) assistant tokens
+    at the END of a conversation, so we keep BOS at position 0 (preserving the
+    BOS-alignment every row relies on) and the conversation's TAIL. A naive front
+    crop would retain only the unsupervised prompt prefix and discard all training
+    signal, producing an all-masked row.
+    """
+    assert max_length > 0
+    if not conversation_buffer:
+        raise ValueError("Cannot select a conversation from an empty buffer")
+
+    best_idx = -1
+    best_len = 0
+    for i, (ids, _) in enumerate(conversation_buffer):
+        conversation_len = len(ids)
+        if conversation_len <= max_length and conversation_len > best_len:
+            best_idx = i
+            best_len = conversation_len
+
+    if best_idx >= 0:
+        # Fits entirely: return it unchanged (no copy on the common packing path).
+        return conversation_buffer.pop(best_idx)
+
+    if not truncate_if_needed:
+        return None
+
+    # Every buffered conversation is too long for an empty row. Crop the shortest
+    # one (fewest discarded tokens), keeping BOS + the supervised tail.
+    shortest_idx = min(range(len(conversation_buffer)), key=lambda i: len(conversation_buffer[i][0]))
+    ids, mask = conversation_buffer.pop(shortest_idx)
+    keep = max_length - 1  # reserve position 0 for BOS
+    ids = [bos_token] + ids[len(ids) - keep:]
+    mask = [0] + mask[len(mask) - keep:]
+    return ids, mask
+
+
+def has_sft_supervised_tokens(mask_rows):
+    """Return whether a packed SFT batch has at least one supervised target token."""
+    # Targets are shifted by one, so mask_rows[:, 0] can never contribute to loss.
+    return any(any(mask_row[1:]) for mask_row in mask_rows)
+
+
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
