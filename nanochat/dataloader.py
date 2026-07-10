@@ -23,8 +23,20 @@ from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
 
-def pop_best_fit_conversation(conversation_buffer, max_length, truncate_if_needed=False):
-    """Pop the largest conversation that fits, optionally truncating as a fallback."""
+def pop_best_fit_conversation(conversation_buffer, max_length, bos_token, truncate_if_needed=False):
+    """Pop the largest buffered conversation that fits entirely in max_length.
+
+    Returns (ids, mask) for the popped conversation, or None when nothing fits and
+    truncation was not requested.
+
+    When no conversation fits and truncate_if_needed is set (only when starting an
+    empty row), fall back to the shortest buffered conversation and crop it to
+    max_length. render_conversation places the supervised (mask==1) assistant tokens
+    at the END of a conversation, so we keep BOS at position 0 (preserving the
+    BOS-alignment every row relies on) and the conversation's TAIL. A naive front
+    crop would retain only the unsupervised prompt prefix and discard all training
+    signal, producing an all-masked row.
+    """
     assert max_length > 0
     if not conversation_buffer:
         raise ValueError("Cannot select a conversation from an empty buffer")
@@ -37,14 +49,21 @@ def pop_best_fit_conversation(conversation_buffer, max_length, truncate_if_neede
             best_idx = i
             best_len = conversation_len
 
-    if best_idx < 0:
-        if not truncate_if_needed:
-            return None
-        # Minimize discarded tokens when every buffered conversation is too long.
-        best_idx = min(range(len(conversation_buffer)), key=lambda i: len(conversation_buffer[i][0]))
+    if best_idx >= 0:
+        # Fits entirely: return it unchanged (no copy on the common packing path).
+        return conversation_buffer.pop(best_idx)
 
-    ids, mask = conversation_buffer.pop(best_idx)
-    return ids[:max_length], mask[:max_length]
+    if not truncate_if_needed:
+        return None
+
+    # Every buffered conversation is too long for an empty row. Crop the shortest
+    # one (fewest discarded tokens), keeping BOS + the supervised tail.
+    shortest_idx = min(range(len(conversation_buffer)), key=lambda i: len(conversation_buffer[i][0]))
+    ids, mask = conversation_buffer.pop(shortest_idx)
+    keep = max_length - 1  # reserve position 0 for BOS
+    ids = [bos_token] + ids[len(ids) - keep:]
+    mask = [0] + mask[len(mask) - keep:]
+    return ids, mask
 
 
 def has_sft_supervised_tokens(mask_rows):
